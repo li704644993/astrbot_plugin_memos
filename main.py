@@ -1,6 +1,7 @@
 import base64
 import mimetypes
 import os
+import random
 import time
 from typing import Optional, List
 
@@ -25,6 +26,9 @@ class MemosPlugin(Star):
         self.default_visibility: str = config.get("default_visibility", "PRIVATE")
         self.allowed_user_ids: list = config.get("allowed_user_ids", [])
         self.allowed_group_ids: list = config.get("allowed_group_ids", [])
+        self.bot_uin: str = config.get("bot_uin", "")
+        self.bot_name: str = config.get("bot_name", "Memos 助手")
+        self.memos_page_size: int = max(1, min(config.get("memos_page_size", 20), 50))
 
         # 资源临时存储目录
         self.resource_dir = os.path.join(os.path.dirname(__file__), "memos_resources")
@@ -169,6 +173,135 @@ class MemosPlugin(Star):
             logger.error(f"[Memos] 发送带附件内容失败: {e}")
             return None
 
+    async def _list_memos_by_filter(self, filter_expr: str, page_size: int = 20) -> List[dict]:
+        """根据过滤条件查询 Memos 列表，支持分页获取全部结果"""
+        url = f"{self.memos_url}/api/v1/memos"
+        all_memos: List[dict] = []
+        page_token = None
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                while True:
+                    params = {
+                        "filter": filter_expr,
+                        "orderBy": "display_time desc",
+                        "pageSize": page_size,
+                    }
+                    if page_token:
+                        params["pageToken"] = page_token
+
+                    response = await client.get(url, headers=self._get_headers(), params=params)
+                    response.raise_for_status()
+                    result = response.json()
+
+                    memos = result.get("memos", [])
+                    all_memos.extend(memos)
+
+                    page_token = result.get("nextPageToken")
+                    if not page_token or len(all_memos) >= page_size:
+                        break
+
+            return all_memos[:page_size]
+        except Exception as e:
+            logger.error(f"[Memos] 查询 Memos 失败 (filter={filter_expr}): {e}")
+            return []
+
+    async def _search_memos_by_tag(self, tag: str) -> List[dict]:
+        """按标签搜索 Memos（使用 CEL 表达式 tags contains）"""
+        filter_expr = f"tags contains '{tag}'"
+        return await self._list_memos_by_filter(filter_expr, self.memos_page_size)
+
+    async def _search_memos_by_content(self, keyword: str) -> List[dict]:
+        """按内容关键词搜索 Memos"""
+        filter_expr = f"content.contains('{keyword}')"
+        return await self._list_memos_by_filter(filter_expr, self.memos_page_size)
+
+    async def _get_random_memo(self) -> Optional[dict]:
+        """获取随机一条笔记"""
+        url = f"{self.memos_url}/api/v1/memos"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # 先获取较大范围的笔记
+                params = {"pageSize": 50, "orderBy": "display_time desc"}
+                response = await client.get(url, headers=self._get_headers(), params=params)
+                response.raise_for_status()
+                result = response.json()
+                memos = result.get("memos", [])
+                if memos:
+                    return random.choice(memos)
+                return None
+        except Exception as e:
+            logger.error(f"[Memos] 获取随机笔记失败: {e}")
+            return None
+
+    async def _update_memo(self, memo_id: str, update_fields: dict, update_paths: List[str]) -> bool:
+        """更新 Memo 的指定字段"""
+        url = f"{self.memos_url}/api/v1/memos/{memo_id}"
+        payload = {
+            "memo": {
+                "name": f"memos/{memo_id}",
+                **update_fields,
+            },
+            "updateMask": {
+                "paths": update_paths,
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.patch(url, headers=self._get_headers(), json=payload)
+                response.raise_for_status()
+                return True
+        except Exception as e:
+            logger.error(f"[Memos] 更新 Memo 失败 (ID={memo_id}): {e}")
+            return False
+
+    async def _get_user_stats(self) -> Optional[dict]:
+        """获取用户统计数据"""
+        # 先尝试获取当前用户信息
+        url = f"{self.memos_url}/api/v1/users/me"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=self._get_headers())
+                response.raise_for_status()
+                user_info = response.json()
+                user_name = user_info.get("name", "")
+                # user_name 格式为 "users/1"，提取 user_id
+                user_id = user_name.split("/")[-1] if user_name else "me"
+
+                # 获取统计数据
+                stats_url = f"{self.memos_url}/api/v1/users/{user_id}:getStats"
+                stats_resp = await client.get(stats_url, headers=self._get_headers())
+                stats_resp.raise_for_status()
+                return stats_resp.json()
+        except Exception as e:
+            logger.error(f"[Memos] 获取用户统计失败: {e}")
+            return None
+
+    # ========================
+    # 消息构建辅助方法
+    # ========================
+
+    def _build_memo_node(self, memo: dict, index: int = 0) -> "Comp.Node":
+        """将单条 Memo 数据构建为合并转发 Node 消息"""
+        content = memo.get("content", "（无内容）")
+        memo_name = memo.get("name", "")
+        memo_id = memo_name.split("/")[-1] if memo_name else "?"
+        create_time = memo.get("createTime", "未知时间")
+        if "T" in create_time:
+            create_time = create_time.split("T")[0]
+        pinned = "📌 " if memo.get("pinned") else ""
+        visibility = memo.get("visibility", "PRIVATE")
+        vis_icon = {"PUBLIC": "🌐", "PROTECTED": "🔓", "PRIVATE": "🔒"}.get(visibility, "")
+
+        text = f"{pinned}{vis_icon} [{create_time}] ID:{memo_id}\n\n{content}"
+
+        uin = int(self.bot_uin) if self.bot_uin.isdigit() else 0
+        return Comp.Node(
+            uin=uin,
+            name=self.bot_name,
+            content=[Comp.Plain(text)],
+        )
+
     # ========================
     # 图片处理相关方法
     # ========================
@@ -291,6 +424,11 @@ class MemosPlugin(Star):
     async def note_list_handler(self, event: AstrMessageEvent):
         """查看最近的 Memos 笔记。用法：/note_list [数量]"""
 
+        # 权限校验
+        if not self._is_authorized(event):
+            yield event.plain_result("❌ 你没有权限使用此功能。")
+            return
+
         if not self.memos_url or not self.memos_access_token:
             yield event.plain_result("❌ Memos 插件未配置，请在管理面板中设置 Memos 地址和访问令牌。")
             return
@@ -385,6 +523,284 @@ class MemosPlugin(Star):
         except Exception as e:
             logger.error(f"[Memos] 删除笔记失败: {e}")
             yield event.plain_result("❌ 删除失败，请稍后重试。")
+
+    @filter.command("note_tag")
+    async def note_tag_handler(self, event: AstrMessageEvent):
+        """按标签搜索笔记，以合并转发消息展示。用法：/note_tag <标签名>"""
+
+        # 权限校验
+        if not self._is_authorized(event):
+            yield event.plain_result("❌ 你没有权限使用此功能。")
+            return
+
+        if not self.memos_url or not self.memos_access_token:
+            yield event.plain_result("❌ Memos 插件未配置，请在管理面板中设置 Memos 地址和访问令牌。")
+            return
+
+        # 解析标签参数
+        raw_text = event.message_str.strip()
+        if raw_text.startswith("note_tag"):
+            tag = raw_text[8:].strip()
+        else:
+            tag = raw_text
+        # 去掉 # 前缀（用户可能输入 #标签）
+        tag = tag.lstrip("#").strip()
+
+        if not tag:
+            yield event.plain_result("❌ 请提供要搜索的标签，例如：/note_tag 日记\n💡 也可以使用 /note_tag #日记")
+            return
+
+        yield event.plain_result(f"🔍 正在搜索标签 #{tag} 下的笔记...")
+
+        memos = await self._search_memos_by_tag(tag)
+
+        if not memos:
+            yield event.plain_result(f"📭 没有找到包含标签 #{tag} 的笔记。")
+            return
+
+        # 使用合并转发消息发送完整内容
+        if self.bot_uin:
+            nodes = []
+            # 添加一个头部说明 Node
+            uin = int(self.bot_uin) if self.bot_uin.isdigit() else 0
+            header_node = Comp.Node(
+                uin=uin,
+                name=self.bot_name,
+                content=[Comp.Plain(f"🏷️ 标签 #{tag} 下共 {len(memos)} 条笔记")],
+            )
+            nodes.append(header_node)
+
+            for i, memo in enumerate(memos):
+                nodes.append(self._build_memo_node(memo, i))
+
+            yield event.chain_result(nodes)
+        else:
+            # 无 bot_uin 降级：逐条发送完整笔记内容
+            yield event.plain_result(f"🏷️ 标签 #{tag} 下共 {len(memos)} 条笔记：")
+            for i, memo in enumerate(memos, 1):
+                content = memo.get("content", "（无内容）")
+                memo_name = memo.get("name", "")
+                memo_id = memo_name.split("/")[-1] if memo_name else "?"
+                create_time = memo.get("createTime", "未知时间")
+                if "T" in create_time:
+                    create_time = create_time.split("T")[0]
+                pinned = "📌 " if memo.get("pinned") else ""
+                visibility = memo.get("visibility", "PRIVATE")
+                vis_icon = {"PUBLIC": "🌐", "PROTECTED": "🔓", "PRIVATE": "🔒"}.get(visibility, "")
+                text = (
+                    f"━━ {i}/{len(memos)} ━━\n"
+                    f"{pinned}{vis_icon} [{create_time}] ID:{memo_id}\n\n"
+                    f"{content}"
+                )
+                yield event.plain_result(text)
+
+    @filter.command("note_search")
+    async def note_search_handler(self, event: AstrMessageEvent):
+        """按关键词搜索笔记内容，以合并转发消息展示。用法：/note_search <关键词>"""
+
+        # 权限校验
+        if not self._is_authorized(event):
+            yield event.plain_result("❌ 你没有权限使用此功能。")
+            return
+
+        if not self.memos_url or not self.memos_access_token:
+            yield event.plain_result("❌ Memos 插件未配置，请在管理面板中设置 Memos 地址和访问令牌。")
+            return
+
+        # 解析关键词参数
+        raw_text = event.message_str.strip()
+        if raw_text.startswith("note_search"):
+            keyword = raw_text[11:].strip()
+        else:
+            keyword = raw_text
+
+        if not keyword:
+            yield event.plain_result("❌ 请提供搜索关键词，例如：/note_search 学习笔记")
+            return
+
+        yield event.plain_result(f"🔍 正在搜索包含「{keyword}」的笔记...")
+
+        memos = await self._search_memos_by_content(keyword)
+
+        if not memos:
+            yield event.plain_result(f"📭 没有找到包含「{keyword}」的笔记。")
+            return
+
+        # 使用合并转发消息发送完整内容
+        if self.bot_uin:
+            nodes = []
+            uin = int(self.bot_uin) if self.bot_uin.isdigit() else 0
+            header_node = Comp.Node(
+                uin=uin,
+                name=self.bot_name,
+                content=[Comp.Plain(f"🔎 搜索「{keyword}」共找到 {len(memos)} 条笔记")],
+            )
+            nodes.append(header_node)
+
+            for i, memo in enumerate(memos):
+                nodes.append(self._build_memo_node(memo, i))
+
+            yield event.chain_result(nodes)
+        else:
+            # 无 bot_uin 降级：逐条发送完整笔记内容
+            yield event.plain_result(f"🔎 搜索「{keyword}」共找到 {len(memos)} 条笔记：")
+            for i, memo in enumerate(memos, 1):
+                content = memo.get("content", "（无内容）")
+                memo_name = memo.get("name", "")
+                memo_id = memo_name.split("/")[-1] if memo_name else "?"
+                create_time = memo.get("createTime", "未知时间")
+                if "T" in create_time:
+                    create_time = create_time.split("T")[0]
+                pinned = "📌 " if memo.get("pinned") else ""
+                visibility = memo.get("visibility", "PRIVATE")
+                vis_icon = {"PUBLIC": "🌐", "PROTECTED": "🔓", "PRIVATE": "🔒"}.get(visibility, "")
+                text = (
+                    f"━━ {i}/{len(memos)} ━━\n"
+                    f"{pinned}{vis_icon} [{create_time}] ID:{memo_id}\n\n"
+                    f"{content}"
+                )
+                yield event.plain_result(text)
+
+    @filter.command("note_pin")
+    async def note_pin_handler(self, event: AstrMessageEvent):
+        """置顶或取消置顶笔记。用法：/note_pin <Memo ID>"""
+
+        # 权限校验
+        if not self._is_authorized(event):
+            yield event.plain_result("❌ 你没有权限使用此功能。")
+            return
+
+        if not self.memos_url or not self.memos_access_token:
+            yield event.plain_result("❌ Memos 插件未配置，请在管理面板中设置 Memos 地址和访问令牌。")
+            return
+
+        # 解析 memo_id
+        raw_text = event.message_str.strip()
+        if raw_text.startswith("note_pin"):
+            memo_id = raw_text[8:].strip()
+        else:
+            memo_id = raw_text
+
+        if not memo_id:
+            yield event.plain_result("❌ 请提供 Memo ID，例如：/note_pin 123")
+            return
+
+        # 先获取当前 memo 的置顶状态
+        url = f"{self.memos_url}/api/v1/memos/{memo_id}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url, headers=self._get_headers())
+                response.raise_for_status()
+                memo = response.json()
+
+            current_pinned = memo.get("pinned", False)
+            new_pinned = not current_pinned
+
+            success = await self._update_memo(memo_id, {"pinned": new_pinned}, ["pinned"])
+            if success:
+                action = "📌 已置顶" if new_pinned else "📌 已取消置顶"
+                yield event.plain_result(f"{action} Memo（ID: {memo_id}）")
+            else:
+                yield event.plain_result("❌ 操作失败，请稍后重试。")
+
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                yield event.plain_result(f"❌ 未找到 ID 为 {memo_id} 的 Memo。")
+            else:
+                logger.error(f"[Memos] 置顶操作失败: {e}")
+                yield event.plain_result("❌ 操作失败，请稍后重试。")
+        except Exception as e:
+            logger.error(f"[Memos] 置顶操作失败: {e}")
+            yield event.plain_result("❌ 操作失败，请稍后重试。")
+
+    @filter.command("note_stats")
+    async def note_stats_handler(self, event: AstrMessageEvent):
+        """查看 Memos 统计数据。用法：/note_stats"""
+
+        # 权限校验
+        if not self._is_authorized(event):
+            yield event.plain_result("❌ 你没有权限使用此功能。")
+            return
+
+        if not self.memos_url or not self.memos_access_token:
+            yield event.plain_result("❌ Memos 插件未配置，请在管理面板中设置 Memos 地址和访问令牌。")
+            return
+
+        yield event.plain_result("📊 正在获取统计数据...")
+
+        stats = await self._get_user_stats()
+        if not stats:
+            yield event.plain_result("❌ 获取统计数据失败，请稍后重试。")
+            return
+
+        # 构建统计信息
+        total_count = stats.get("totalMemoCount", 0)
+        tag_count: dict = stats.get("tagCount", {})
+        memo_type_stats: dict = stats.get("memoTypeStats", {})
+        pinned_memos: list = stats.get("pinnedMemos", [])
+
+        lines = ["📊 Memos 统计数据\n"]
+        lines.append(f"📝 笔记总数：{total_count}")
+        lines.append(f"📌 置顶笔记：{len(pinned_memos)} 条")
+
+        # 内容类型统计
+        link_count = memo_type_stats.get("linkCount", 0)
+        code_count = memo_type_stats.get("codeCount", 0)
+        todo_count = memo_type_stats.get("incompleteTodoCount", 0)
+        if link_count or code_count or todo_count:
+            lines.append(f"\n📈 内容类型：")
+            if link_count:
+                lines.append(f"  🔗 含链接：{link_count} 条")
+            if code_count:
+                lines.append(f"  💻 含代码：{code_count} 条")
+            if todo_count:
+                lines.append(f"  ☑️ 待办事项：{todo_count} 条未完成")
+
+        # 标签统计（按数量排序，最多显示15个）
+        if tag_count:
+            sorted_tags = sorted(tag_count.items(), key=lambda x: x[1], reverse=True)[:15]
+            lines.append(f"\n🏷️ 标签统计（Top {len(sorted_tags)}）：")
+            for tag_name, count in sorted_tags:
+                lines.append(f"  #{tag_name}  ×{count}")
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("note_random")
+    async def note_random_handler(self, event: AstrMessageEvent):
+        """随机回顾一条历史笔记。用法：/note_random"""
+
+        # 权限校验
+        if not self._is_authorized(event):
+            yield event.plain_result("❌ 你没有权限使用此功能。")
+            return
+
+        if not self.memos_url or not self.memos_access_token:
+            yield event.plain_result("❌ Memos 插件未配置，请在管理面板中设置 Memos 地址和访问令牌。")
+            return
+
+        memo = await self._get_random_memo()
+        if not memo:
+            yield event.plain_result("📭 暂无笔记可供回顾。")
+            return
+
+        content = memo.get("content", "（无内容）")
+        memo_name = memo.get("name", "")
+        memo_id = memo_name.split("/")[-1] if memo_name else "?"
+        create_time = memo.get("createTime", "未知时间")
+        if "T" in create_time:
+            create_time = create_time.split("T")[0]
+        pinned = "📌 " if memo.get("pinned") else ""
+        visibility = memo.get("visibility", "PRIVATE")
+        vis_icon = {"PUBLIC": "🌐", "PROTECTED": "🔓", "PRIVATE": "🔒"}.get(visibility, "")
+
+        text = (
+            f"🎲 随机回顾\n"
+            f"━━━━━━━━━━━━\n"
+            f"{pinned}{vis_icon} [{create_time}] ID:{memo_id}\n\n"
+            f"{content}"
+        )
+
+        yield event.plain_result(text)
 
     async def terminate(self):
         """插件销毁时清理资源目录"""

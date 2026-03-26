@@ -34,5 +34,23 @@
     "type": "list",
     "hint": "允许使用本插件的群组ID列表，为空则不限制群组",
     "default": []
+  },
+  "bot_uin": {
+    "description": "机器人QQ号",
+    "type": "string",
+    "hint": "用于合并转发消息的发送者身份（OneBot v11），填写机器人的QQ号",
+    "default": ""
+  },
+  "bot_name": {
+    "description": "机器人名称",
+    "type": "string",
+    "hint": "合并转发消息中显示的发送者名称",
+    "default": "Memos 助手"
+  },
+  "memos_page_size": {
+    "description": "搜索结果页大小",
+    "type": "int",
+    "hint": "按标签/关键词搜索时，每次最多返回的笔记数量（1~50）",
+    "default": 20
   }
 }
