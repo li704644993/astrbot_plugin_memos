@@ -1,0 +1,38 @@
+{
+  "memos_url": {
+    "description": "Memos 实例地址",
+    "type": "string",
+    "hint": "你的 Memos 服务地址，例如 https://note.example.com",
+    "default": ""
+  },
+  "memos_access_token": {
+    "description": "Memos 访问令牌",
+    "type": "string",
+    "hint": "在 Memos 设置中生成的 Access Token",
+    "default": ""
+  },
+  "default_tags": {
+    "description": "默认标签",
+    "type": "list",
+    "hint": "创建 Memo 时自动添加的标签列表，例如 [\"日记\", \"笔记\"]",
+    "default": []
+  },
+  "default_visibility": {
+    "description": "默认可见性",
+    "type": "string",
+    "hint": "Memo 的默认可见性：PRIVATE（私有）、PROTECTED（受保护）、PUBLIC（公开）",
+    "default": "PRIVATE"
+  },
+  "allowed_user_ids": {
+    "description": "允许使用的用户ID",
+    "type": "list",
+    "hint": "允许使用本插件的用户ID列表，为空则不限制用户",
+    "default": []
+  },
+  "allowed_group_ids": {
+    "description": "允许使用的群组ID",
+    "type": "list",
+    "hint": "允许使用本插件的群组ID列表，为空则不限制群组",
+    "default": []
+  }
+}
